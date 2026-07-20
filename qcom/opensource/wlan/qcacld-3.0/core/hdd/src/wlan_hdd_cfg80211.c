@@ -30,6 +30,8 @@
 #include <linux/init.h>
 #include <linux/etherdevice.h>
 #include <linux/wireless.h>
+#include <linux/cred.h>
+#include <linux/uidgid.h>
 #include "osif_sync.h"
 #include <wlan_hdd_includes.h>
 #include <net/arp.h>
@@ -161,6 +163,9 @@
 #include "os_if_nan.h"
 #include "wlan_hdd_apf.h"
 #include "wlan_hdd_cfr.h"
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+#include "wlan_hdd_frame_inject.h"
+#endif
 #include "wlan_hdd_ioctl.h"
 #include "wlan_cm_roam_ucfg_api.h"
 #include "hif.h"
@@ -19497,8 +19502,13 @@ const struct wiphy_vendor_command hdd_wiphy_vendor_commands[] = {
 	FEATURE_DISA_VENDOR_COMMANDS
 	FEATURE_TDLS_VENDOR_COMMANDS
 	FEATURE_SAR_LIMITS_VENDOR_COMMANDS
-	BCN_RECV_FEATURE_VENDOR_COMMANDS
 	FEATURE_VENDOR_SUBCMD_SET_TRACE_LEVEL
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	FEATURE_FRAME_INJECTION_VENDOR_COMMANDS
+#endif
+#ifdef WLAN_BCN_RECV_FEATURE
+	BCN_RECV_FEATURE_VENDOR_COMMANDS
+#endif
 #ifdef WLAN_FEATURE_LINK_LAYER_STATS
 	{
 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
@@ -21187,6 +21197,7 @@ static bool hdd_is_client_mode(enum QDF_OPMODE mode)
 	case QDF_STA_MODE:
 	case QDF_P2P_CLIENT_MODE:
 	case QDF_P2P_DEVICE_MODE:
+	case QDF_MONITOR_MODE:
 		return true;
 	default:
 		return false;
@@ -21198,6 +21209,7 @@ static bool hdd_is_ap_mode(enum QDF_OPMODE mode)
 	switch (mode) {
 	case QDF_SAP_MODE:
 	case QDF_P2P_GO_MODE:
+	case QDF_MONITOR_MODE:
 		return true;
 	default:
 		return false;
@@ -21342,6 +21354,32 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
 		  ndev->name,
 		  qdf_opmode_str(adapter->device_mode),
 		  qdf_opmode_str(new_mode));
+
+	if (adapter->device_mode == QDF_MONITOR_MODE &&
+	    new_mode == QDF_MONITOR_MODE) {
+		ndev->ieee80211_ptr->iftype = type;
+		hdd_exit();
+		return 0;
+	}
+
+	/*
+	 * Android framework daemons can race monitor mode by forcing station
+	 * iftype transitions right after monitor enable. Reject non-root
+	 * monitor->non-monitor requests while monitor global mode is active.
+	 *
+	 * Return an error instead of success so cfg80211 doesn't WARN on
+	 * iftype mismatch (it expects iftype to match @type when callback
+	 * returns success).
+	 */
+	if ((adapter->device_mode == QDF_MONITOR_MODE ||
+	     hdd_get_conparam() == QDF_GLOBAL_MONITOR_MODE) &&
+	    new_mode != QDF_MONITOR_MODE &&
+	    !uid_eq(current_euid(), GLOBAL_ROOT_UID)) {
+		hdd_warn_rl("rejecting monitor->%s iface change from %s",
+			    qdf_opmode_str(new_mode), current->comm);
+		hdd_exit();
+		return -EOPNOTSUPP;
+	}
 
 	errno = hdd_trigger_psoc_idle_restart(hdd_ctx);
 	if (errno) {
@@ -25722,6 +25760,7 @@ int wlan_hdd_change_hw_mode_for_given_chnl(struct hdd_adapter *adapter,
 }
 
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
+
 /**
  * __wlan_hdd_cfg80211_set_mon_ch() - Set monitor mode capture channel
  * @wiphy: Handle to struct wiphy to get handle to module context.
@@ -25888,6 +25927,26 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 		adapter->monitor_mode_vdev_up_in_progress = false;
 		return qdf_status_to_os_return(status);
 	}
+
+	adapter->mon_chan_freq = chandef->chan->center_freq;
+	adapter->mon_bandwidth = ch_width;
+
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	/*
+	 * Proactively re-tune the injection helper STA vdev to the new
+	 * monitor channel.  Without this, injected frames would briefly
+	 * go out on the old frequency until the next injection attempt
+	 * detects the mismatch and triggers a lazy re-tune.
+	 */
+	{
+		tp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);
+
+		if (wma)
+			wma_injection_notify_channel_change(
+				wma, adapter->vdev_id,
+				chandef->chan->center_freq);
+	}
+#endif
 
 	hdd_exit();
 
@@ -27041,7 +27100,10 @@ static int __wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,
  * @link_id: Channel link ID
  * @chandef: Pointer to channel definition
  *
- * Return: 0 for success, non zero for failure
+ * Required by nl80211 (NL80211_CMD_GET_INTERFACE) and wext (SIOCGIWFREQ)
+ * so that tools like aireplay-ng / mdk3 can determine the current channel.
+ *
+ * Return: 0 on success, -ENODATA if no channel is set.
  */
 #ifdef CFG80211_SINGLE_NETDEV_MULTI_LINK_SUPPORT
 static int wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,
@@ -27049,9 +27111,56 @@ static int wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,
 					 unsigned int link_id,
 					 struct cfg80211_chan_def *chandef)
 {
+	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(wdev->netdev);
+	struct hdd_station_ctx *sta_ctx;
+	struct hdd_mon_set_ch_info *ch_info;
+	struct ieee80211_channel *chan;
 	int errno;
 	struct osif_vdev_sync *vdev_sync;
+	uint32_t freq;
 
+	if (!adapter)
+		return -ENODATA;
+
+	/* --- LOGIC FOR MONITOR MODE --- */
+	if (adapter->device_mode == QDF_MONITOR_MODE) {
+		/* Primary source: mon_chan_freq */
+		freq = adapter->mon_chan_freq;
+
+		/* Fallback: station context ch_info */
+		if (!freq) {
+			sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);
+			ch_info = &sta_ctx->ch_info;
+			freq = ch_info->freq;
+		}
+
+		if (!freq)
+			return -ENODATA;
+
+		chan = ieee80211_get_channel(wiphy, freq);
+		if (!chan)
+			return -ENODATA;
+
+		cfg80211_chandef_create(chandef, chan, NL80211_CHAN_NO_HT);
+
+		/* Upgrade width if we know the bandwidth */
+		switch (adapter->mon_bandwidth) {
+		case CH_WIDTH_40MHZ:
+			chandef->width = NL80211_CHAN_WIDTH_40;
+			break;
+		case CH_WIDTH_80MHZ:
+			chandef->width = NL80211_CHAN_WIDTH_80;
+			break;
+		case CH_WIDTH_160MHZ:
+			chandef->width = NL80211_CHAN_WIDTH_160;
+			break;
+		default:
+			break;
+		}
+		return 0;
+	}
+
+	/* --- LOGIC FOR NORMAL MODES (Station, SAP, etc.) --- */
 	errno = osif_vdev_sync_op_start(wdev->netdev, &vdev_sync);
 	if (errno)
 		return errno;
@@ -27067,10 +27176,58 @@ static int wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,
 					 struct wireless_dev *wdev,
 					 struct cfg80211_chan_def *chandef)
 {
+	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(wdev->netdev);
+	struct hdd_station_ctx *sta_ctx;
+	struct hdd_mon_set_ch_info *ch_info;
+	struct ieee80211_channel *chan;
 	int errno;
 	struct osif_vdev_sync *vdev_sync;
 	/* Legacy purposes */
 	int link_id = -1;
+	uint32_t freq;
+
+	if (!adapter)
+		return -ENODATA;
+
+	/* --- LOGIC FOR MONITOR MODE --- */
+	if (adapter->device_mode == QDF_MONITOR_MODE) {
+		/* Primary source: mon_chan_freq */
+		freq = adapter->mon_chan_freq;
+
+		/* Fallback: station context ch_info */
+		if (!freq) {
+			sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);
+			ch_info = &sta_ctx->ch_info;
+			freq = ch_info->freq;
+		}
+
+		if (!freq)
+			return -ENODATA;
+
+		chan = ieee80211_get_channel(wiphy, freq);
+		if (!chan)
+			return -ENODATA;
+
+		cfg80211_chandef_create(chandef, chan, NL80211_CHAN_NO_HT);
+
+		/* Upgrade width if we know the bandwidth */
+		switch (adapter->mon_bandwidth) {
+		case CH_WIDTH_40MHZ:
+			chandef->width = NL80211_CHAN_WIDTH_40;
+			break;
+		case CH_WIDTH_80MHZ:
+			chandef->width = NL80211_CHAN_WIDTH_80;
+			break;
+		case CH_WIDTH_160MHZ:
+			chandef->width = NL80211_CHAN_WIDTH_160;
+			break;
+		default:
+			break;
+		}
+		return 0;
+	}
+
+	/* --- LOGIC FOR NORMAL MODES (Station, SAP, etc.) --- */
 
 	errno = osif_vdev_sync_op_start(wdev->netdev, &vdev_sync);
 	if (errno)

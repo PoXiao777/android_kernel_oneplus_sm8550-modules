@@ -34,14 +34,14 @@ int hdd_enable_monitor_mode(struct net_device *dev);
  *
  * Return: 0 for success; non-zero for failure
  */
-int hdd_disable_monitor_mode(void);
+int hdd_disable_monitor_mode(struct net_device *dev);
 #else
 static inline int hdd_enable_monitor_mode(struct net_device *dev)
 {
 	return 0;
 }
 
-static inline int hdd_disable_monitor_mode(void)
+static inline int hdd_disable_monitor_mode(struct net_device *dev)
 {
 	return 0;
 }

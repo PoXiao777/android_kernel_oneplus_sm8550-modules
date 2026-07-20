@@ -39,6 +39,9 @@ CONFIG_CFG_BMISS_OFFLOAD_MAX_VDEV := 4
 #Max MLD dev context
 CONFIG_WLAN_UMAC_MLO_MAX_DEV := 3
 
+# Enable monitor-mode frame injection support
+CONFIG_FEATURE_FRAME_INJECTION_SUPPORT := y
+
 #Chip version
 CONFIG_CHIP_VERSION := 2
 
