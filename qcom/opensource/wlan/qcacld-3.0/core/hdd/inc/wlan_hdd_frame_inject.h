@@ -213,6 +213,12 @@ struct inject_frame_req {
  * @rate_limit_hits: Rate limiting events
  * @queue_overflows: Queue overflow events
  * @firmware_errors: Firmware rejection count
+ * @command_submitted: WMI commands successfully submitted
+ * @tx_complete_ok: Firmware COMPLETE_OK count
+ * @tx_complete_no_ack: Firmware COMPLETE_NO_ACK count
+ * @tx_complete_discard: Firmware DISCARD count
+ * @tx_timeout: Firmware completion timeout count
+ * @peer_not_found: Unicast frames without a legitimate associated peer
  * @last_inject_time: Timestamp of last injection
  * @total_inject_time: Total time spent in injection (microseconds)
  */
@@ -225,6 +231,12 @@ struct injection_stats {
 	uint64_t rate_limit_hits;
 	uint64_t queue_overflows;
 	uint64_t firmware_errors;
+	uint64_t command_submitted;
+	uint64_t tx_complete_ok;
+	uint64_t tx_complete_no_ack;
+	uint64_t tx_complete_discard;
+	uint64_t tx_timeout;
+	uint64_t peer_not_found;
 	uint64_t last_inject_time;
 	uint64_t total_inject_time;
 	/* Performance monitoring fields */

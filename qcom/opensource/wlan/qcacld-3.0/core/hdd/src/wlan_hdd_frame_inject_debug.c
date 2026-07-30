@@ -75,7 +75,8 @@ static ssize_t hdd_injection_debugfs_stats_show(struct file *file,
 {
 	struct hdd_adapter *adapter = file->private_data;
 	struct hdd_injection_ctx *injection_ctx;
-	struct injection_stats *stats;
+	struct injection_stats aggregate_stats;
+	struct injection_stats *stats = &aggregate_stats;
 	char *debug_buf;
 	int len = 0;
 	ssize_t ret;
@@ -85,7 +86,9 @@ static ssize_t hdd_injection_debugfs_stats_show(struct file *file,
 	}
 
 	injection_ctx = adapter->injection_ctx;
-	stats = &injection_ctx->security_ctx.stats;
+	qdf_mem_zero(stats, sizeof(*stats));
+	if (QDF_IS_STATUS_ERROR(hdd_get_injection_stats(adapter, stats)))
+		return -EIO;
 
 	debug_buf = qdf_mem_malloc(2048);
 	if (!debug_buf) {
@@ -112,6 +115,18 @@ static ssize_t hdd_injection_debugfs_stats_show(struct file *file,
 			 "Queue Overflows:      %llu\n", stats->queue_overflows);
 	len += scnprintf(debug_buf + len, 2048 - len,
 			 "Firmware Errors:      %llu\n", stats->firmware_errors);
+	len += scnprintf(debug_buf + len, 2048 - len,
+			 "Command Submitted:    %llu\n", stats->command_submitted);
+	len += scnprintf(debug_buf + len, 2048 - len,
+			 "TX Complete OK:       %llu\n", stats->tx_complete_ok);
+	len += scnprintf(debug_buf + len, 2048 - len,
+			 "TX Complete No ACK:   %llu\n", stats->tx_complete_no_ack);
+	len += scnprintf(debug_buf + len, 2048 - len,
+			 "TX Complete Discard:  %llu\n", stats->tx_complete_discard);
+	len += scnprintf(debug_buf + len, 2048 - len,
+			 "TX Timeout:           %llu\n", stats->tx_timeout);
+	len += scnprintf(debug_buf + len, 2048 - len,
+			 "Peer Not Found:       %llu\n", stats->peer_not_found);
 	len += scnprintf(debug_buf + len, 2048 - len,
 			 "Last Inject Time:     %llu\n", stats->last_inject_time);
 	len += scnprintf(debug_buf + len, 2048 - len,

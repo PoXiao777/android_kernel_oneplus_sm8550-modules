@@ -773,8 +773,6 @@ inject_done:
 			req->complete_time = qdf_get_log_timestamp();
 
 			if (QDF_IS_STATUS_SUCCESS(wma_status)) {
-				hdd_update_injection_stats(injection_ctx->adapter, HDD_INJECTION_STAT_FRAMES_TRANSMITTED, 1);
-
 				/* Calculate and update latency statistics */
 				total_latency = req->complete_time - req->submit_time;
 				hdd_update_injection_latency(injection_ctx->adapter, total_latency);
@@ -786,15 +784,12 @@ inject_done:
 				hdd_inject_err("Failed to queue frame to WMA: %d", wma_status);
 			}
 		} else {
-			/* Fallback: just update statistics if WMA handle not available */
+			/* No lower-layer submission occurred. */
 			req->complete_time = qdf_get_log_timestamp();
-			hdd_update_injection_stats(injection_ctx->adapter, HDD_INJECTION_STAT_FRAMES_TRANSMITTED, 1);
-
-			/* Calculate and update latency statistics */
-			total_latency = req->complete_time - req->submit_time;
-			hdd_update_injection_latency(injection_ctx->adapter, total_latency);
-
-			hdd_inject_warn("WMA handle not available, simulating transmission");
+			hdd_update_injection_stats(injection_ctx->adapter,
+						   HDD_INJECTION_STAT_FRAMES_DROPPED,
+						   1);
+			hdd_inject_warn("WMA handle not available, dropping frame");
 		}
 
 		hdd_inject_debug("Processed injection request: session_id=%u",
@@ -1602,6 +1597,12 @@ QDF_STATUS hdd_get_injection_stats(struct hdd_adapter *adapter,
 			stats->frames_dropped += wma_stats.frames_dropped;
 			stats->queue_overflows += wma_stats.queue_overflows;
 			stats->firmware_errors += wma_stats.fw_errors;
+			stats->command_submitted += wma_stats.command_submitted;
+			stats->tx_complete_ok += wma_stats.tx_complete_ok;
+			stats->tx_complete_no_ack += wma_stats.tx_complete_no_ack;
+			stats->tx_complete_discard += wma_stats.tx_complete_discard;
+			stats->tx_timeout += wma_stats.tx_timeout;
+			stats->peer_not_found += wma_stats.peer_not_found;
 			
 			/* Update timing statistics */
 			if (wma_stats.frames_processed > 0) {

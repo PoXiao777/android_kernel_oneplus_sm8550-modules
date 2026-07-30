@@ -165,6 +165,7 @@
 #include "wlan_hdd_cfr.h"
 #ifdef FEATURE_FRAME_INJECTION_SUPPORT
 #include "wlan_hdd_frame_inject.h"
+#include "wma_frame_inject.h"
 #endif
 #include "wlan_hdd_ioctl.h"
 #include "wlan_cm_roam_ucfg_api.h"
