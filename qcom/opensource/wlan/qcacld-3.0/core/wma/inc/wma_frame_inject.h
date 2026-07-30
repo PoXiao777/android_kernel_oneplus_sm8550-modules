@@ -108,7 +108,7 @@ struct wma_injection_fw_error_info {
  * @tx_complete_no_ack: Firmware completions reporting COMPLETE_NO_ACK
  * @tx_complete_discard: Firmware completions reporting DISCARD
  * @tx_timeout: Submitted commands with no completion before the timeout
- * @peer_not_found: Unicast frames rejected because no associated peer exists
+ * @peer_not_found: Regular-vdev unicast rejected because no associated peer exists
  * @last_fw_error: Information about last firmware error
  */
 struct wma_injection_queue_stats {

@@ -194,7 +194,7 @@ static struct wma_injection_debug_info
 	g_wma_injection_debug_cache[WMA_INJECTION_DEBUG_CACHE_SIZE];
 
 /*
- * Hidden STA vdev for group-addressed injection TX on monitor mode.
+ * Hidden STA vdev for injection TX on monitor mode.
  *
  * The firmware's mgmt TX handler (FUN_b000fc10, _wlan_send_mgmt_to_host)
  * unconditionally rejects management frames on MONITOR vdevs: the internal
@@ -203,9 +203,10 @@ static struct wma_injection_debug_info
  * beacon-only fallback (FUN_b01baa34) that always returns 5 → DISCARD.
  *
  * Work around this by creating a lightweight STA vdev on the same channel
- * as the monitor interface and routing group-addressed frames through it. The
- * vdev has a self-peer (stored at firmware vdev+0xc) so the firmware can
- * schedule and transmit the management frame normally.
+ * as the monitor interface and routing raw frames through it. The vdev has a
+ * self-peer (stored at firmware vdev+0xc) for group traffic and one transient
+ * destination peer for directed traffic. The latter lets firmware resolve
+ * Addr1 without changing any address carried in the injected frame.
  *
  * Lifecycle:
  *   Created lazily on the first injection attempt on a monitor vdev.
@@ -216,15 +217,76 @@ static struct wma_injection_debug_info
  */
 struct wma_injection_tx_vdev {
 	bool created;
+	bool unicast_peer_created;
 	uint8_t vdev_id;
 	uint8_t monitor_vdev_id;
 	uint32_t chanfreq;
 	uint8_t mac_addr[QDF_MAC_ADDR_SIZE];
+	uint8_t unicast_peer_addr[QDF_MAC_ADDR_SIZE];
 };
 
 static struct wma_injection_tx_vdev g_inj_tx_vdev;
 
 static void wma_injection_destroy_tx_vdev(tp_wma_handle wma);
+static uint32_t wma_injection_vdev_inflight(uint8_t vdev_id);
+
+static QDF_STATUS
+wma_injection_ensure_unicast_peer(tp_wma_handle wma, const uint8_t *peer_addr)
+{
+	struct peer_create_params create = {0};
+	struct peer_delete_cmd_params delete = {0};
+	QDF_STATUS status;
+
+	if (!wma || !wma->wmi_handle || !g_inj_tx_vdev.created || !peer_addr ||
+	    qdf_is_macaddr_group((struct qdf_mac_addr *)peer_addr) ||
+	    qdf_is_macaddr_zero((struct qdf_mac_addr *)peer_addr))
+		return QDF_STATUS_E_INVAL;
+
+	if (g_inj_tx_vdev.unicast_peer_created &&
+	    !qdf_mem_cmp(g_inj_tx_vdev.unicast_peer_addr, peer_addr,
+			 QDF_MAC_ADDR_SIZE))
+		return QDF_STATUS_SUCCESS;
+
+	/* Do not invalidate the peer while firmware may still use it for TX. */
+	if (g_inj_tx_vdev.unicast_peer_created) {
+		if (wma_injection_vdev_inflight(g_inj_tx_vdev.vdev_id))
+			return QDF_STATUS_E_BUSY;
+
+		delete.vdev_id = g_inj_tx_vdev.vdev_id;
+		status = wmi_unified_peer_delete_send(
+			wma->wmi_handle, g_inj_tx_vdev.unicast_peer_addr, &delete);
+		if (QDF_IS_STATUS_ERROR(status)) {
+			wma_err("Injection unicast peer delete failed: vdev=%u peer=%pM status=%d",
+				g_inj_tx_vdev.vdev_id,
+				g_inj_tx_vdev.unicast_peer_addr, status);
+			return status;
+		}
+
+		qdf_sleep(10);
+		g_inj_tx_vdev.unicast_peer_created = false;
+		qdf_mem_zero(g_inj_tx_vdev.unicast_peer_addr,
+			     QDF_MAC_ADDR_SIZE);
+	}
+
+	create.peer_addr = (uint8_t *)peer_addr;
+	create.peer_type = WMI_PEER_TYPE_DEFAULT;
+	create.vdev_id = g_inj_tx_vdev.vdev_id;
+	status = wmi_unified_peer_create_send(wma->wmi_handle, &create);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		wma_err("Injection unicast peer create failed: vdev=%u peer=%pM status=%d",
+			g_inj_tx_vdev.vdev_id, peer_addr, status);
+		return status;
+	}
+
+	qdf_sleep(10);
+	qdf_mem_copy(g_inj_tx_vdev.unicast_peer_addr, peer_addr,
+		     QDF_MAC_ADDR_SIZE);
+	g_inj_tx_vdev.unicast_peer_created = true;
+	wma_info("Injection unicast peer ready: vdev=%u peer=%pM",
+		 g_inj_tx_vdev.vdev_id, peer_addr);
+
+	return QDF_STATUS_SUCCESS;
+}
 
 static void wma_injection_reclaim_vdev_nbufs(uint8_t vdev_id)
 {
@@ -653,13 +715,19 @@ static void wma_injection_destroy_tx_vdev(tp_wma_handle wma)
 	 * pending DELETE and firmware asserts.
 	 */
 
-	/* 1. PEER_DELETE */
+	/* 1. Delete the transient destination peer, then the self-peer. */
 	{
 		struct peer_delete_cmd_params del_param = {0};
 
 		del_param.vdev_id = g_inj_tx_vdev.vdev_id;
+		if (g_inj_tx_vdev.unicast_peer_created) {
+			wmi_unified_peer_delete_send(
+				wma->wmi_handle,
+				g_inj_tx_vdev.unicast_peer_addr, &del_param);
+			qdf_sleep(10);
+		}
 		wmi_unified_peer_delete_send(wma->wmi_handle,
-					     g_inj_tx_vdev.mac_addr,
+						     g_inj_tx_vdev.mac_addr,
 					     &del_param);
 	}
 	qdf_sleep(10);
@@ -722,13 +790,19 @@ void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
 	wma_info("Pre-stop cleanup: destroying injection helper vdev_id=%u",
 		 g_inj_tx_vdev.vdev_id);
 
-	/* 1. PEER_DELETE */
+	/* 1. Delete the transient destination peer, then the self-peer. */
 	{
 		struct peer_delete_cmd_params del_param = {0};
 
 		del_param.vdev_id = g_inj_tx_vdev.vdev_id;
+		if (g_inj_tx_vdev.unicast_peer_created) {
+			wmi_unified_peer_delete_send(
+				wma_handle->wmi_handle,
+				g_inj_tx_vdev.unicast_peer_addr, &del_param);
+			qdf_sleep(10);
+		}
 		wmi_unified_peer_delete_send(wma_handle->wmi_handle,
-					     g_inj_tx_vdev.mac_addr,
+						     g_inj_tx_vdev.mac_addr,
 					     &del_param);
 	}
 	qdf_sleep(10);
@@ -1095,6 +1169,7 @@ QDF_STATUS wma_process_injection_queue(tp_wma_handle wma_handle)
 	uint32_t deferred_count = 0;
 	const uint32_t max_process_per_cycle = 64;
 	bool queue_was_empty;
+	bool retry_deferred = false;
 
 	if (!wma_handle) {
 		wma_err("Invalid WMA handle");
@@ -1154,11 +1229,26 @@ QDF_STATUS wma_process_injection_queue(tp_wma_handle wma_handle)
 		ctx->queue_size--;
 		qdf_spin_unlock_bh(&ctx->queue_lock);
 
-		/* Update queue time statistics */
-		ctx->stats.total_queue_time += (current_time - node->timestamp);
-
 		/* Send frame to firmware */
 		status = wma_send_injection_frame_to_fw(wma_handle, &node->req, node->vdev_id);
+		if (status == QDF_STATUS_E_BUSY) {
+			/* Preserve FIFO order until the previous destination peer is idle. */
+			qdf_spin_lock_bh(&ctx->queue_lock);
+			status = qdf_list_insert_front(&ctx->queue, &node->node);
+			if (!QDF_IS_STATUS_ERROR(status))
+				ctx->queue_size++;
+			qdf_spin_unlock_bh(&ctx->queue_lock);
+			if (QDF_IS_STATUS_ERROR(status)) {
+				ctx->stats.frames_dropped++;
+				wma_injection_queue_node_free(node);
+			}
+			deferred_count++;
+			retry_deferred = true;
+			break;
+		}
+
+		/* Update queue time statistics after final submission disposition. */
+		ctx->stats.total_queue_time += (current_time - node->timestamp);
 		if (QDF_IS_STATUS_ERROR(status)) {
 			ctx->stats.frames_dropped++;
 			wma_err("Failed to send injection frame to firmware: %d", status);
@@ -1173,7 +1263,7 @@ QDF_STATUS wma_process_injection_queue(tp_wma_handle wma_handle)
 	wma_debug("Injection queue processing cycle complete: processed=%u, deferred=%u",
 		  processed_count, deferred_count);
 
-	return QDF_STATUS_SUCCESS;
+	return retry_deferred ? QDF_STATUS_E_BUSY : QDF_STATUS_SUCCESS;
 }
 
 /**
@@ -1205,7 +1295,7 @@ static void wma_process_injection_queue_work(void *arg)
 
 	/* Process the queue */
 	status = wma_process_injection_queue(wma_handle);
-	if (QDF_IS_STATUS_ERROR(status)) {
+	if (QDF_IS_STATUS_ERROR(status) && status != QDF_STATUS_E_BUSY) {
 		wma_err("Failed to process injection queue: %d", status);
 	}
 
@@ -1216,7 +1306,8 @@ static void wma_process_injection_queue_work(void *arg)
 
 	if (queue_has_frames) {
 		/* Apply backpressure if queue is congested */
-		backpressure_delay = wma_apply_injection_backpressure(ctx);
+		backpressure_delay = status == QDF_STATUS_E_BUSY ? 2 :
+			wma_apply_injection_backpressure(ctx);
 		
 		if (backpressure_delay > 0) {
 			qdf_delayed_work_start(&ctx->delayed_work, backpressure_delay);
@@ -1520,13 +1611,15 @@ QDF_STATUS wma_queue_injection_frame(tp_wma_handle wma_handle,
 	}
 
 	/*
-	 * Reject an unknown unicast management destination before queueing.  The
-	 * send path repeats this lookup to close the peer-delete race between
-	 * enqueue and WMI submission.
+	 * For a regular vdev, reject an unknown unicast management destination
+	 * before queueing. Monitor vdevs preserve raw Addr1/Addr2/Addr3 and create a
+	 * transient firmware peer in the send path.
 	 */
 	if (req->frame_len >= 24 &&
 	    (req->frame_data[0] & 0x0c) == 0x00 &&
-	    !qdf_is_macaddr_group((struct qdf_mac_addr *)&req->frame_data[4])) {
+	    !qdf_is_macaddr_group((struct qdf_mac_addr *)&req->frame_data[4]) &&
+	    vdev_id < wma_handle->max_bssid &&
+	    wma_handle->interfaces[vdev_id].type != WMI_VDEV_TYPE_MONITOR) {
 		uint8_t resolved_vdev;
 		uint8_t resolved_type;
 		uint16_t resolved_freq;
@@ -1859,10 +1952,11 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	}
 
 	/*
-	 * A unicast management frame must use the real vdev that owns Addr1's
-	 * connected peer.  This deliberately bypasses the helper STA/self-peer.
+	 * Regular vdev unicast must use the real vdev that owns Addr1's connected
+	 * peer. Monitor unicast remains on the raw helper path, where a transient
+	 * firmware peer is created without rewriting the supplied frame addresses.
 	 */
-	if (fc_type == 0x00 && !is_group_da) {
+	if (fc_type == 0x00 && !is_group_da && !source_monitor_vdev) {
 		if (fc_subtype != 0xd0 || req->frame_len < 25 ||
 		    req->frame_data[24] != 4 || (req->frame_data[1] & 0x43)) {
 			if (g_wma_injection_ctx.stats.frames_dropped <= 10)
@@ -2009,7 +2103,8 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 		/*
 		 * FW _wlan_send_mgmt_to_host rejects MONITOR vdevs (falls
 		 * to a beacon-only path → DISCARD).  Route through a hidden
-		 * STA helper vdev instead, which FW accepts for group mgmt TX.
+		 * STA helper vdev instead. Its self-peer handles group traffic and a
+		 * transient Addr1 peer handles directed traffic.
 		 */
 		status = wma_injection_ensure_tx_vdev(wma_handle,
 						     vdev_id, tx_chanfreq);
@@ -2021,8 +2116,17 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 		}
 		mgmt_params.vdev_id = g_inj_tx_vdev.vdev_id;
 		tx_vdev_type = WMI_VDEV_TYPE_STA;
+		if (!is_group_da && req->frame_len >= 10) {
+			status = wma_injection_ensure_unicast_peer(
+				wma_handle, frame_data + 4);
+			if (QDF_IS_STATUS_ERROR(status)) {
+				qdf_nbuf_free(wmi_buf);
+				return status;
+			}
+			peer_exists = true;
+		}
 		if (!inject_monitor_no_legacy_logged) {
-			wma_warn("Injection monitor: using hidden STA vdev %u for group TX (monitor vdev %u)",
+			wma_warn("Injection monitor: using hidden STA vdev %u for raw TX (monitor vdev %u)",
 				 g_inj_tx_vdev.vdev_id, vdev_id);
 			inject_monitor_no_legacy_logged = true;
 		}
