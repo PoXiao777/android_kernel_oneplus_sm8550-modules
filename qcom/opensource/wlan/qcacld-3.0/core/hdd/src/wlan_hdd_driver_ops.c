@@ -50,6 +50,8 @@
 #include "wlan_hdd_thermal.h"
 #include "wlan_dp_ucfg_api.h"
 #include "qdf_ssr_driver_dump.h"
+#include "wlan_hdd_frame_inject.h"
+#include "wma_frame_inject.h"
 
 #ifdef MODULE
 #ifdef WLAN_WEAR_CHIPSET
@@ -66,6 +68,22 @@ static uint8_t re_init_fail_cnt, probe_fail_cnt;
 
 /* An atomic flag to check if SSR cleanup has been done or not */
 static qdf_atomic_t is_recovery_cleanup_done;
+
+static QDF_STATUS
+hdd_injection_ssr_quiesce_adapter(struct hdd_adapter *adapter, void *context)
+{
+	(void)context;
+	hdd_frame_injection_ssr_quiesce(adapter);
+	return QDF_STATUS_SUCCESS;
+}
+
+static QDF_STATUS
+hdd_injection_ssr_resume_adapter(struct hdd_adapter *adapter, void *context)
+{
+	(void)context;
+	hdd_frame_injection_ssr_resume(adapter);
+	return QDF_STATUS_SUCCESS;
+}
 
 /* firmware/host hang event data */
 static uint8_t g_fw_host_hang_event[QDF_HANG_EVENT_DATA_SIZE];
@@ -800,6 +818,7 @@ static int __hdd_soc_recovery_reinit(struct device *dev,
 				     enum qdf_bus_type bus_type)
 {
 	int errno;
+	tp_wma_handle wma;
 	struct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
 
 	hdd_info("re-probing driver");
@@ -833,7 +852,11 @@ static int __hdd_soc_recovery_reinit(struct device *dev,
 	 * in progress
 	 */
 	if (!qdf_is_fw_down()) {
+		wma = cds_get_context(QDF_MODULE_ID_WMA);
 		cds_set_recovery_in_progress(false);
+		if (wma)
+			wma_injection_ssr_resume(wma);
+		hdd_adapter_iterate(hdd_injection_ssr_resume_adapter, NULL);
 		hdd_handle_cached_commands();
 	}
 
@@ -1055,6 +1078,7 @@ static void hdd_soc_recovery_cleanup(void)
 		return;
 	}
 
+	hdd_adapter_iterate(hdd_injection_ssr_quiesce_adapter, NULL);
 	hdd_psoc_shutdown_notify(hdd_ctx);
 	hdd_exit();
 }

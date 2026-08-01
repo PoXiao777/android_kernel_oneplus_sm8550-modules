@@ -28,6 +28,7 @@
 #include <wmi_unified_param.h>
 #include <wlan_objmgr_psoc_obj.h>
 #include <wlan_lmac_if_def.h>
+#include <wlan_vdev_mgr_tgt_if_rx_defs.h>
 #include <qdf_platform.h>
 
 /**
@@ -163,5 +164,38 @@ QDF_STATUS target_if_vdev_mgr_wmi_event_unregister(
  * Return: none
  */
 void target_if_vdev_mgr_rsp_timer_cb(void *arg);
+
+/**
+ * target_if_vdev_mgr_fw_only_rsp_prepare() - Arm firmware-only vdev response
+ * @vdev_id: firmware-only vdev id
+ * @rsp_bit: response type expected by the direct WMI caller
+ *
+ * Return: QDF_STATUS_SUCCESS when the response waiter is armed
+ */
+QDF_STATUS target_if_vdev_mgr_fw_only_rsp_prepare(
+			uint8_t vdev_id,
+			enum wlan_vdev_mgr_tgt_if_rsp_bit rsp_bit);
+
+/**
+ * target_if_vdev_mgr_fw_only_rsp_wait() - Wait for firmware-only vdev response
+ * @vdev_id: firmware-only vdev id
+ * @rsp_bit: response type expected by the direct WMI caller
+ * @timeout_ms: maximum wait in milliseconds
+ *
+ * Return: QDF_STATUS_SUCCESS when the matching firmware event is received
+ */
+QDF_STATUS target_if_vdev_mgr_fw_only_rsp_wait(
+			uint8_t vdev_id,
+			enum wlan_vdev_mgr_tgt_if_rsp_bit rsp_bit,
+			uint32_t timeout_ms);
+
+/**
+ * target_if_vdev_mgr_fw_only_rsp_cancel() - Disarm a response waiter
+ * @vdev_id: firmware-only vdev id
+ * @rsp_bit: response type being cancelled
+ */
+void target_if_vdev_mgr_fw_only_rsp_cancel(
+			uint8_t vdev_id,
+			enum wlan_vdev_mgr_tgt_if_rsp_bit rsp_bit);
 
 #endif /* __TARGET_IF_VDEV_MGR_RX_OPS_H__ */

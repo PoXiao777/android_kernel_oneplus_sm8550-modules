@@ -25789,6 +25789,10 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 	uint8_t max_fw_bw;
 	enum phy_ch_width ch_width;
 	qdf_freq_t sec_ch_2g_freq = 0;
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	tp_wma_handle injection_wma = NULL;
+	bool injection_transition = false;
+#endif
 
 	hdd_enter();
 
@@ -25857,21 +25861,46 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 						chandef->chan->center_freq,
 						sec_ch_2g_freq, &ch_params,
 						REG_CURRENT_PWR_MODE);
-	if (wlan_hdd_change_hw_mode_for_given_chnl(adapter,
-						   chandef->chan->center_freq,
-						   POLICY_MGR_UPDATE_REASON_SET_OPER_CHAN)) {
-		hdd_err("Failed to change hw mode");
-		return -EINVAL;
-	}
-
 	if (adapter->monitor_mode_vdev_up_in_progress) {
 		hdd_err_rl("monitor mode vdev up in progress");
 		return -EBUSY;
 	}
 
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	injection_wma = cds_get_context(QDF_MODULE_ID_WMA);
+	if (injection_wma) {
+		status = wma_injection_notify_channel_change(
+			injection_wma, adapter->vdev_id,
+			chandef->chan->center_freq);
+		if (QDF_IS_STATUS_ERROR(status)) {
+			hdd_err_rl("Injection helper blocked monitor retune to %u: %d",
+				   chandef->chan->center_freq, status);
+			return qdf_status_to_os_return(status);
+		}
+		injection_transition = true;
+	}
+#endif
+
+	if (wlan_hdd_change_hw_mode_for_given_chnl(adapter,
+						   chandef->chan->center_freq,
+						   POLICY_MGR_UPDATE_REASON_SET_OPER_CHAN)) {
+		hdd_err("Failed to change hw mode");
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+		if (injection_transition)
+			wma_injection_complete_channel_change(
+				injection_wma, adapter->vdev_id, false);
+#endif
+		return -EINVAL;
+	}
+
 	status = qdf_event_reset(&adapter->qdf_monitor_mode_vdev_up_event);
 	if (QDF_IS_STATUS_ERROR(status)) {
 		hdd_err_rl("failed to reinit monitor mode vdev up event");
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+		if (injection_transition)
+			wma_injection_complete_channel_change(
+				injection_wma, adapter->vdev_id, false);
+#endif
 		return qdf_status_to_os_return(status);
 	}
 	adapter->monitor_mode_vdev_up_in_progress = true;
@@ -25879,8 +25908,15 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 	qdf_mem_zero(&ch_params, sizeof(struct ch_params));
 
 	req = qdf_mem_malloc(sizeof(struct channel_change_req));
-	if (!req)
+	if (!req) {
+		adapter->monitor_mode_vdev_up_in_progress = false;
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+		if (injection_transition)
+			wma_injection_complete_channel_change(
+				injection_wma, adapter->vdev_id, false);
+#endif
 		return -ENOMEM;
+	}
 
 	req->vdev_id = adapter->vdev_id;
 	req->target_chan_freq = chandef->chan->center_freq;
@@ -25903,6 +25939,11 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 			   status);
 		adapter->monitor_mode_vdev_up_in_progress = false;
 		ret = qdf_status_to_os_return(status);
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+		if (injection_transition)
+			wma_injection_complete_channel_change(
+				injection_wma, adapter->vdev_id, false);
+#endif
 		return ret;
 	}
 
@@ -25926,6 +25967,11 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 				  status);
 
 		adapter->monitor_mode_vdev_up_in_progress = false;
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+		if (injection_transition)
+			wma_injection_complete_channel_change(
+				injection_wma, adapter->vdev_id, false);
+#endif
 		return qdf_status_to_os_return(status);
 	}
 
@@ -25933,20 +25979,9 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 	adapter->mon_bandwidth = ch_width;
 
 #ifdef FEATURE_FRAME_INJECTION_SUPPORT
-	/*
-	 * Proactively re-tune the injection helper STA vdev to the new
-	 * monitor channel.  Without this, injected frames would briefly
-	 * go out on the old frequency until the next injection attempt
-	 * detects the mismatch and triggers a lazy re-tune.
-	 */
-	{
-		tp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);
-
-		if (wma)
-			wma_injection_notify_channel_change(
-				wma, adapter->vdev_id,
-				chandef->chan->center_freq);
-	}
+	if (injection_transition)
+		wma_injection_complete_channel_change(
+			injection_wma, adapter->vdev_id, true);
 #endif
 
 	hdd_exit();

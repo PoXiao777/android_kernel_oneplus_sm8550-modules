@@ -38,6 +38,7 @@
 #include <qdf_lock.h>
 #include <qdf_timer.h>
 #include <qdf_defer.h>
+#include <qdf_delayed_work.h>
 #include "wlan_hdd_frame_validate.h"
 #include "wlan_hdd_inject_security.h"
 #include "wlan_hdd_frame_inject_debug.h"
@@ -53,6 +54,9 @@ struct wireless_dev;
 
 /* Maximum number of frames in injection queue per adapter */
 #define HDD_FRAME_INJECT_MAX_QUEUE_SIZE  64
+
+/* Back off briefly when the WMA queue or channel transition is busy. */
+#define HDD_FRAME_INJECT_RETRY_DELAY_MS  2
 
 /* Default rate limit: frames per second */
 #define HDD_FRAME_INJECT_DEFAULT_RATE_LIMIT  100
@@ -370,6 +374,8 @@ struct hdd_injection_recovery_ctx {
  * @security_ctx: Security and rate limiting context
  * @is_monitor_mode: Flag indicating if adapter is in monitor mode
  * @queue_work: Work item for processing injection queue
+ * @retry_work: Delayed work used when WMA applies backpressure
+ * @queue_stopping: Queue teardown has blocked new work and retries
  * @adapter: Back pointer to HDD adapter
  * @wma_handle: WMA handle for firmware communication
  * @recovery_ctx: Error recovery context
@@ -381,6 +387,8 @@ struct hdd_injection_ctx {
 	struct injection_security_ctx security_ctx;
 	bool is_monitor_mode;
 	qdf_work_t queue_work;
+	struct qdf_delayed_work retry_work;
+	bool queue_stopping;
 	struct hdd_adapter *adapter;
 	void *wma_handle;
 	struct hdd_injection_recovery_ctx recovery_ctx;
@@ -463,6 +471,18 @@ QDF_STATUS hdd_init_frame_injection(struct hdd_adapter *adapter);
  * Return: QDF_STATUS_SUCCESS on success, error code on failure
  */
 QDF_STATUS hdd_deinit_frame_injection(struct hdd_adapter *adapter);
+
+/**
+ * hdd_frame_injection_ssr_quiesce() - Stop producers for SSR
+ * @adapter: HDD adapter
+ */
+void hdd_frame_injection_ssr_quiesce(struct hdd_adapter *adapter);
+
+/**
+ * hdd_frame_injection_ssr_resume() - Bind injection to the new WMA context
+ * @adapter: HDD adapter
+ */
+void hdd_frame_injection_ssr_resume(struct hdd_adapter *adapter);
 
 /**
  * hdd_frame_inject_enable() - Enable frame injection for adapter
@@ -679,6 +699,15 @@ static inline QDF_STATUS hdd_init_frame_injection(struct hdd_adapter *adapter)
 static inline QDF_STATUS hdd_deinit_frame_injection(struct hdd_adapter *adapter)
 {
 	return QDF_STATUS_SUCCESS;
+}
+
+static inline void
+hdd_frame_injection_ssr_quiesce(struct hdd_adapter *adapter)
+{
+}
+
+static inline void hdd_frame_injection_ssr_resume(struct hdd_adapter *adapter)
+{
 }
 
 static inline QDF_STATUS hdd_frame_inject_enable(struct hdd_adapter *adapter)

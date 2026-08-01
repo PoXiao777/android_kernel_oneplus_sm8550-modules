@@ -155,6 +155,19 @@ QDF_STATUS wma_init_injection_queue(tp_wma_handle wma_handle);
 QDF_STATUS wma_deinit_injection_queue(tp_wma_handle wma_handle);
 
 /**
+ * wma_injection_ssr_resume() - Resume periodic injection maintenance after SSR
+ * @wma_handle: New WMA context
+ */
+void wma_injection_ssr_resume(tp_wma_handle wma_handle);
+
+bool wma_injection_peer_create_response(uint8_t vdev_id,
+					const uint8_t *peer_addr,
+					uint32_t fw_status);
+
+bool wma_injection_peer_delete_response(uint8_t vdev_id,
+					const uint8_t *peer_addr);
+
+/**
  * wma_injection_pre_stop_cleanup() - Destroy injection helper vdev before
  *                                     monitor mode stop
  * @wma_handle: WMA handle
@@ -166,14 +179,31 @@ QDF_STATUS wma_deinit_injection_queue(tp_wma_handle wma_handle);
 void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle);
 
 /**
- * wma_injection_notify_channel_change() - Retune the monitor TX helper
+ * wma_injection_notify_channel_change() - Retarget the monitor TX helper
  * @wma_handle: WMA handle
  * @mon_vdev_id: Monitor vdev whose channel changed
  * @new_freq: New channel frequency in MHz
+ *
+ * Drains and retargets a helper on a different frequency before the real
+ * monitor vdev is retuned. After directed-peer injection, the helper is
+ * recreated on every target frequency before monitor restart. Submissions
+ * remain gated until completion, and a failed transition releases the helper.
+ *
+ * Return: QDF_STATUS_SUCCESS when no helper can retain the old channel
  */
-void wma_injection_notify_channel_change(tp_wma_handle wma_handle,
-					 uint8_t mon_vdev_id,
-					 uint32_t new_freq);
+QDF_STATUS wma_injection_notify_channel_change(tp_wma_handle wma_handle,
+					       uint8_t mon_vdev_id,
+					       uint32_t new_freq);
+
+/**
+ * wma_injection_complete_channel_change() - Resume helper submissions
+ * @wma_handle: WMA handle
+ * @mon_vdev_id: Monitor vdev whose restart completed
+ * @success: Whether the monitor restart completed successfully
+ */
+void wma_injection_complete_channel_change(tp_wma_handle wma_handle,
+					   uint8_t mon_vdev_id,
+					   bool success);
 
 /**
  * wma_queue_injection_frame() - Queue frame for injection
@@ -359,14 +389,41 @@ static inline QDF_STATUS wma_deinit_injection_queue(tp_wma_handle wma_handle)
 	return QDF_STATUS_SUCCESS;
 }
 
+static inline void wma_injection_ssr_resume(tp_wma_handle wma_handle)
+{
+}
+
+static inline bool
+wma_injection_peer_create_response(uint8_t vdev_id,
+				   const uint8_t *peer_addr,
+				   uint32_t fw_status)
+{
+	return false;
+}
+
+static inline bool
+wma_injection_peer_delete_response(uint8_t vdev_id,
+				   const uint8_t *peer_addr)
+{
+	return false;
+}
+
 static inline void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
 {
 }
 
-static inline void
+static inline QDF_STATUS
 wma_injection_notify_channel_change(tp_wma_handle wma_handle,
 				    uint8_t mon_vdev_id,
 				    uint32_t new_freq)
+{
+	return QDF_STATUS_SUCCESS;
+}
+
+static inline void
+wma_injection_complete_channel_change(tp_wma_handle wma_handle,
+				      uint8_t mon_vdev_id,
+				      bool success)
 {
 }
 

@@ -33,9 +33,104 @@
 #include <wlan_vdev_mlme_main.h>
 #include <wmi_unified_vdev_api.h>
 #include <target_if_psoc_wake_lock.h>
+#include <qdf_threads.h>
 #ifdef WLAN_FEATURE_ROAM_OFFLOAD
 #include <target_if_cm_roam_offload.h>
 #endif
+
+#define TARGET_IF_FW_ONLY_RSP_POLL_MS 5
+
+struct target_if_fw_only_rsp_state {
+	qdf_atomic_t expected;
+	qdf_atomic_t completed;
+	qdf_atomic_t result;
+};
+
+static struct target_if_fw_only_rsp_state
+	target_if_fw_only_rsp[WLAN_UMAC_PSOC_MAX_VDEVS];
+
+static bool target_if_vdev_mgr_fw_only_rsp_valid(
+			uint8_t vdev_id,
+			enum wlan_vdev_mgr_tgt_if_rsp_bit rsp_bit)
+{
+	return vdev_id < WLAN_UMAC_PSOC_MAX_VDEVS &&
+		(rsp_bit == START_RESPONSE_BIT ||
+		 rsp_bit == RESTART_RESPONSE_BIT ||
+		 rsp_bit == STOP_RESPONSE_BIT || rsp_bit == DELETE_RESPONSE_BIT);
+}
+
+QDF_STATUS target_if_vdev_mgr_fw_only_rsp_prepare(
+			uint8_t vdev_id,
+			enum wlan_vdev_mgr_tgt_if_rsp_bit rsp_bit)
+{
+	if (!target_if_vdev_mgr_fw_only_rsp_valid(vdev_id, rsp_bit))
+		return QDF_STATUS_E_INVAL;
+
+	qdf_atomic_set(&target_if_fw_only_rsp[vdev_id].completed, 0);
+	qdf_atomic_set(&target_if_fw_only_rsp[vdev_id].result,
+		       QDF_STATUS_SUCCESS);
+	qdf_atomic_set(&target_if_fw_only_rsp[vdev_id].expected, rsp_bit + 1);
+	return QDF_STATUS_SUCCESS;
+}
+
+void target_if_vdev_mgr_fw_only_rsp_cancel(
+			uint8_t vdev_id,
+			enum wlan_vdev_mgr_tgt_if_rsp_bit rsp_bit)
+{
+	if (!target_if_vdev_mgr_fw_only_rsp_valid(vdev_id, rsp_bit))
+		return;
+	if (qdf_atomic_read(&target_if_fw_only_rsp[vdev_id].expected) !=
+	    rsp_bit + 1)
+		return;
+
+	qdf_atomic_set(&target_if_fw_only_rsp[vdev_id].expected, 0);
+	qdf_atomic_set(&target_if_fw_only_rsp[vdev_id].completed, 0);
+}
+
+QDF_STATUS target_if_vdev_mgr_fw_only_rsp_wait(
+			uint8_t vdev_id,
+			enum wlan_vdev_mgr_tgt_if_rsp_bit rsp_bit,
+			uint32_t timeout_ms)
+{
+	uint32_t waited_ms = 0;
+	int expected = rsp_bit + 1;
+	QDF_STATUS status;
+
+	if (!target_if_vdev_mgr_fw_only_rsp_valid(vdev_id, rsp_bit))
+		return QDF_STATUS_E_INVAL;
+
+	while (qdf_atomic_read(&target_if_fw_only_rsp[vdev_id].completed) !=
+	       expected && waited_ms < timeout_ms) {
+		qdf_sleep(TARGET_IF_FW_ONLY_RSP_POLL_MS);
+		waited_ms += TARGET_IF_FW_ONLY_RSP_POLL_MS;
+	}
+
+	if (qdf_atomic_read(&target_if_fw_only_rsp[vdev_id].completed) !=
+	    expected) {
+		target_if_vdev_mgr_fw_only_rsp_cancel(vdev_id, rsp_bit);
+		return QDF_STATUS_E_TIMEOUT;
+	}
+
+	status = qdf_atomic_read(&target_if_fw_only_rsp[vdev_id].result);
+	target_if_vdev_mgr_fw_only_rsp_cancel(vdev_id, rsp_bit);
+	return status;
+}
+
+static void target_if_vdev_mgr_fw_only_rsp_complete(
+			uint8_t vdev_id,
+			enum wlan_vdev_mgr_tgt_if_rsp_bit rsp_bit,
+			QDF_STATUS status)
+{
+	int expected = rsp_bit + 1;
+
+	if (!target_if_vdev_mgr_fw_only_rsp_valid(vdev_id, rsp_bit) ||
+	    qdf_atomic_read(&target_if_fw_only_rsp[vdev_id].expected) !=
+	    expected)
+		return;
+
+	qdf_atomic_set(&target_if_fw_only_rsp[vdev_id].result, status);
+	qdf_atomic_set(&target_if_fw_only_rsp[vdev_id].completed, expected);
+}
 
 static inline
 void target_if_vdev_mgr_handle_recovery(struct wlan_objmgr_psoc *psoc,
@@ -280,6 +375,31 @@ void target_if_vdev_mgr_rsp_timer_mgmt_cb(void *arg)
 #define VDEV_RSP_RX_CTX WMI_RX_UMAC_CTX
 #endif
 
+static bool
+target_if_vdev_mgr_is_firmware_only_vdev(struct wlan_objmgr_psoc *psoc,
+					 uint8_t vdev_id,
+					 struct vdev_response_timer *vdev_rsp,
+					 enum wlan_vdev_mgr_tgt_if_rsp_bit rsp_bit)
+{
+	struct wlan_objmgr_vdev *vdev;
+
+	if (!target_if_vdev_mgr_fw_only_rsp_valid(vdev_id, rsp_bit))
+		return false;
+	if (qdf_atomic_test_bit(rsp_bit, &vdev_rsp->rsp_status))
+		return false;
+	if (qdf_atomic_read(&target_if_fw_only_rsp[vdev_id].expected) !=
+	    rsp_bit + 1)
+		return false;
+
+	vdev = wlan_objmgr_get_vdev_by_id_from_psoc(psoc, vdev_id,
+						    WLAN_VDEV_TARGET_IF_ID);
+	if (!vdev)
+		return true;
+
+	wlan_objmgr_vdev_release_ref(vdev, WLAN_VDEV_TARGET_IF_ID);
+	return false;
+}
+
 static int target_if_vdev_mgr_start_response_handler(ol_scn_t scn,
 						     uint8_t *data,
 						     uint32_t datalen)
@@ -326,6 +446,22 @@ static int target_if_vdev_mgr_start_response_handler(ol_scn_t scn,
 		mlme_err("vdev response timer is null VDEV_%d PSOC_%d",
 			 vdev_id, wlan_psoc_get_id(psoc));
 		return -EINVAL;
+	}
+	if (target_if_vdev_mgr_is_firmware_only_vdev(
+			psoc, vdev_id, vdev_rsp,
+			vdev_start_resp.resp_type ==
+			WMI_HOST_VDEV_RESTART_RESP_EVENT ?
+			RESTART_RESPONSE_BIT : START_RESPONSE_BIT)) {
+		target_if_vdev_mgr_fw_only_rsp_complete(
+			vdev_id,
+			vdev_start_resp.resp_type ==
+			WMI_HOST_VDEV_RESTART_RESP_EVENT ?
+			RESTART_RESPONSE_BIT : START_RESPONSE_BIT,
+			vdev_start_resp.status ? QDF_STATUS_E_FAILURE :
+			QDF_STATUS_SUCCESS);
+		mlme_debug("Ignoring start response for firmware-only VDEV_%u",
+			   vdev_id);
+		return 0;
 	}
 
 	if (vdev_start_resp.resp_type == WMI_HOST_VDEV_RESTART_RESP_EVENT)
@@ -387,12 +523,20 @@ static int target_if_vdev_mgr_stop_response_handler(ol_scn_t scn,
 		mlme_err("WMI extract failed");
 		return -EINVAL;
 	}
-
 	vdev_rsp = rx_ops->psoc_get_vdev_response_timer_info(psoc, vdev_id);
 	if (!vdev_rsp) {
 		mlme_err("vdev response timer is null VDEV_%d PSOC_%d",
 			 vdev_id, wlan_psoc_get_id(psoc));
 		return -EINVAL;
+	}
+	if (target_if_vdev_mgr_is_firmware_only_vdev(
+			psoc, vdev_id, vdev_rsp, STOP_RESPONSE_BIT)) {
+		target_if_vdev_mgr_fw_only_rsp_complete(vdev_id,
+						 STOP_RESPONSE_BIT,
+						 QDF_STATUS_SUCCESS);
+		mlme_debug("Ignoring stop response for firmware-only VDEV_%u",
+			   vdev_id);
+		return 0;
 	}
 
 	status = target_if_vdev_mgr_rsp_timer_stop(psoc, vdev_rsp,
@@ -449,13 +593,22 @@ static int target_if_vdev_mgr_delete_response_handler(ol_scn_t scn,
 		mlme_err("WMI extract failed");
 		return -EINVAL;
 	}
-
 	vdev_rsp = rx_ops->psoc_get_vdev_response_timer_info(psoc,
 							 vdev_del_resp.vdev_id);
 	if (!vdev_rsp) {
 		mlme_err("vdev response timer is null VDEV_%d PSOC_%d",
 			 vdev_del_resp.vdev_id, wlan_psoc_get_id(psoc));
 		return -EINVAL;
+	}
+	if (target_if_vdev_mgr_is_firmware_only_vdev(
+			psoc, vdev_del_resp.vdev_id, vdev_rsp,
+			DELETE_RESPONSE_BIT)) {
+		target_if_vdev_mgr_fw_only_rsp_complete(
+			vdev_del_resp.vdev_id, DELETE_RESPONSE_BIT,
+			QDF_STATUS_SUCCESS);
+		mlme_debug("Ignoring delete response for firmware-only VDEV_%u",
+			   vdev_del_resp.vdev_id);
+		return 0;
 	}
 
 	status = target_if_vdev_mgr_rsp_timer_stop(
@@ -1040,6 +1193,7 @@ QDF_STATUS target_if_vdev_mgr_wmi_event_register(
 {
 	QDF_STATUS retval = QDF_STATUS_SUCCESS;
 	struct wmi_unified *wmi_handle;
+	uint8_t i;
 
 	if (!psoc) {
 		mlme_err("PSOC is NULL");
@@ -1050,6 +1204,12 @@ QDF_STATUS target_if_vdev_mgr_wmi_event_register(
 	if (!wmi_handle) {
 		mlme_err("wmi_handle is null");
 		return QDF_STATUS_E_INVAL;
+	}
+
+	for (i = 0; i < WLAN_UMAC_PSOC_MAX_VDEVS; i++) {
+		qdf_atomic_init(&target_if_fw_only_rsp[i].expected);
+		qdf_atomic_init(&target_if_fw_only_rsp[i].completed);
+		qdf_atomic_init(&target_if_fw_only_rsp[i].result);
 	}
 
 	retval = wmi_unified_register_event_handler(
