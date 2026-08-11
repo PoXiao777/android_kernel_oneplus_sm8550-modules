@@ -56,7 +56,7 @@ struct wireless_dev;
 #define HDD_FRAME_INJECT_MAX_QUEUE_SIZE  64
 
 /* Back off briefly when the WMA queue or channel transition is busy. */
-#define HDD_FRAME_INJECT_RETRY_DELAY_MS  2
+#define HDD_FRAME_INJECT_RETRY_DELAY_MS  50
 
 /* Default rate limit: frames per second */
 #define HDD_FRAME_INJECT_DEFAULT_RATE_LIMIT  100

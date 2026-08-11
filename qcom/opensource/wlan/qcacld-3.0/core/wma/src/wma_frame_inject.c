@@ -93,6 +93,16 @@ static inline void wma_injection_unmap_tx_buf(qdf_nbuf_t buf)
 #define WMA_INJECTION_HELPER_RSP_TIMEOUT_MS 1000
 
 /*
+ * Idle reclaim: destroy the injection helper when no frames have been
+ * submitted for this long, so monitor RX is not affected by a stale
+ * helper after injection stops.
+ */
+#define WMA_INJECTION_IDLE_RECLAIM_DELAY_MS 5000
+
+/* Defer helper creation until monitor channel hopping has stopped. */
+#define WMA_INJECTION_CHANNEL_SETTLE_MS 750
+
+/*
  * Maximum age in microseconds before an in-flight nbuf is considered
  * abandoned by firmware and reaped. Normal completions arrive in < 50 ms.
  */
@@ -134,7 +144,10 @@ struct wma_injection_queue_node {
  * @delayed_work: Delayed work item for backpressure handling
  * @helper_stopping: Driver stop has disabled helper work and WMI teardown
  * @helper_transitioning: Channel change is draining helper submissions
+ * @channel_settling: Injection remains queued until the monitor channel settles
  * @recreate_helper_on_retune: Directed-peer session requires fresh helper
+ * @idle_work: Delayed work item for idle helper reclaim
+ * @settle_work: Delayed work item for channel-stability gating
  * @stats: Queue statistics
  * @is_initialized: Initialization flag
  */
@@ -148,9 +161,12 @@ struct wma_injection_queue_ctx {
 	qdf_work_t queue_work;
 	struct qdf_delayed_work delayed_work;
 	struct qdf_delayed_work reaper_work; /* periodic stale-nbuf reaper */
+	struct qdf_delayed_work idle_work; /* idle helper reclaim timer */
+	struct qdf_delayed_work settle_work; /* monitor channel settle timer */
 	qdf_atomic_t inflight_count; /* nbufs submitted to FW, not yet completed */
 	bool helper_stopping;
 	bool helper_transitioning;
+	bool channel_settling;
 	bool recreate_helper_on_retune;
 	struct wma_injection_queue_stats stats;
 	bool is_initialized;
@@ -347,7 +363,7 @@ bool wma_injection_peer_create_response(uint8_t vdev_id,
 	handled = wma_injection_peer_rsp_complete(
 		vdev_id, peer_addr, WMA_INJECTION_PEER_RSP_CREATE, status);
 	if (handled)
-		wma_info("Injection peer create response: fw_status=%u accepted=%u vdev=%u peer=%pM",
+		wma_debug("Injection peer create response: fw_status=%u accepted=%u vdev=%u peer=%pM",
 			 fw_status, QDF_IS_STATUS_SUCCESS(status), vdev_id,
 			 peer_addr);
 
@@ -473,7 +489,7 @@ wma_injection_ensure_unicast_peer(tp_wma_handle wma, const uint8_t *peer_addr)
 	g_inj_tx_vdev.unicast_peer_create_pending = false;
 	g_wma_injection_ctx.recreate_helper_on_retune = true;
 	qdf_sleep(WMA_INJECTION_PEER_COOLDOWN_MS);
-	wma_info("Injection unicast peer ready: vdev=%u peer=%pM synchronized=%u",
+	wma_debug("Injection unicast peer ready: vdev=%u peer=%pM synchronized=%u",
 		 g_inj_tx_vdev.vdev_id, peer_addr, sync_peer_rsp);
 
 	return QDF_STATUS_SUCCESS;
@@ -753,9 +769,9 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 				g_inj_tx_vdev.vdev_id, RESTART_RESPONSE_BIT,
 				WMA_INJECTION_HELPER_RSP_TIMEOUT_MS);
 			if (QDF_IS_STATUS_ERROR(status)) {
-				wma_err("Injection helper restart response failed: vdev=%u freq=%u status=%d",
-					g_inj_tx_vdev.vdev_id, chanfreq, status);
-				return status;
+				wma_warn("Injection helper restart response failed: vdev=%u freq=%u status=%d, recreating",
+					 g_inj_tx_vdev.vdev_id, chanfreq, status);
+				goto restart_failed;
 			}
 
 			/* Keep the helper TX-only so monitor RX remains on its vdev. */
@@ -783,7 +799,19 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 
 		wma_err("Injection helper restart send failed: vdev=%u freq=%u status=%d",
 			g_inj_tx_vdev.vdev_id, chanfreq, status);
-		return status;
+restart_failed:
+		/*
+		 * Firmware rejects restarting a replacement STA helper, so fall
+		 * back to a fresh create instead of leaving the caller to retry
+		 * the doomed restart (which only generates a retry storm).
+		 */
+		status = wma_injection_destroy_tx_vdev(wma);
+		if (QDF_IS_STATUS_ERROR(status)) {
+			wma_warn("Injection helper recreate after restart failure failed: %d",
+				 status);
+			return status;
+		}
+		/* Fall through to the fresh-create path below. */
 	}
 
 	/*
@@ -1192,6 +1220,8 @@ void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
 
 	ctx->helper_stopping = true;
 	if (ctx->is_initialized) {
+		qdf_delayed_work_stop_sync(&ctx->settle_work);
+		qdf_delayed_work_stop_sync(&ctx->idle_work);
 		/* Stop the injection worker before deleting its firmware endpoint. */
 		wma_flush_injection_queue(wma_handle);
 	}
@@ -1217,9 +1247,10 @@ void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
  * @new_freq: New channel frequency in MHz
  *
  * Drain and retarget the hidden STA helper before the real monitor vdev changes
- * channel. After directed-peer injection, recreate the helper on every retune
- * because firmware rejects restarting a replacement STA in that session.
- * Submissions remain gated until wma_injection_complete_channel_change().
+ * channel. Recreate the helper after directed-peer injection because this
+ * firmware rejects restarting that helper session. Submissions remain gated
+ * until
+ * wma_injection_complete_channel_change().
  *
  * Return: QDF_STATUS_SUCCESS when the old helper no longer owns the channel
  */
@@ -1232,22 +1263,31 @@ QDF_STATUS wma_injection_notify_channel_change(tp_wma_handle wma_handle,
 	uint32_t drain_wait_ms = 0;
 	uint32_t inflight;
 	uint8_t helper_vdev_id = WLAN_UMAC_VDEV_ID_MAX;
+	bool defer_helper_until_stable;
 
 	if (!wma_handle || !new_freq)
 		return QDF_STATUS_E_INVAL;
 
 	if (!ctx->is_initialized)
 		return QDF_STATUS_SUCCESS;
+
 	if (ctx->helper_stopping || !wma_handle->wmi_handle ||
 	    wmi_is_blocked(wma_handle->wmi_handle))
 		return QDF_STATUS_E_AGAIN;
+
+	/* A new monitor request supersedes the previous settle deadline. */
+	qdf_delayed_work_stop_sync(&ctx->settle_work);
 
 	/*
 	 * Claim the transition under the helper mutex, then release it before
 	 * waiting because cleanup may currently own the mutex.
 	 */
-	if (QDF_IS_STATUS_ERROR(qdf_mutex_acquire(&ctx->helper_lock)))
+	if (QDF_IS_STATUS_ERROR(qdf_mutex_acquire(&ctx->helper_lock))) {
+		if (ctx->channel_settling)
+			qdf_delayed_work_start(&ctx->settle_work,
+					       WMA_INJECTION_CHANNEL_SETTLE_MS);
 		return QDF_STATUS_E_BUSY;
+	}
 	if (!ctx->is_initialized || ctx->helper_stopping ||
 	    ctx->helper_transitioning) {
 		status = ctx->helper_transitioning ? QDF_STATUS_E_BUSY :
@@ -1255,6 +1295,8 @@ QDF_STATUS wma_injection_notify_channel_change(tp_wma_handle wma_handle,
 		qdf_mutex_release(&ctx->helper_lock);
 		return status;
 	}
+	defer_helper_until_stable = ctx->channel_settling;
+	ctx->channel_settling = true;
 	if (!g_inj_tx_vdev.created ||
 	    g_inj_tx_vdev.monitor_vdev_id != mon_vdev_id ||
 	    g_inj_tx_vdev.chanfreq == new_freq) {
@@ -1265,6 +1307,7 @@ QDF_STATUS wma_injection_notify_channel_change(tp_wma_handle wma_handle,
 	qdf_mutex_release(&ctx->helper_lock);
 
 	/* Quiesce workers without dropping requests already owned by WMA. */
+	qdf_delayed_work_stop_sync(&ctx->idle_work);
 	qdf_cancel_work(&ctx->queue_work);
 	qdf_flush_work(&ctx->queue_work);
 	qdf_delayed_work_stop_sync(&ctx->delayed_work);
@@ -1320,7 +1363,21 @@ QDF_STATUS wma_injection_notify_channel_change(tp_wma_handle wma_handle,
 	if (QDF_IS_STATUS_SUCCESS(status) && g_inj_tx_vdev.created &&
 	    g_inj_tx_vdev.monitor_vdev_id == mon_vdev_id &&
 	    !wma_injection_vdev_inflight(g_inj_tx_vdev.vdev_id)) {
-		if (ctx->recreate_helper_on_retune) {
+		if (defer_helper_until_stable) {
+			/*
+			 * The monitor moved again before the previous settle timer
+			 * expired. Remove the old RF owner once and leave queued
+			 * injection paused until the final channel is stable.
+			 */
+			wma_info("Monitor hopping to %u MHz: defer TX helper vdev %u until channel settles",
+				 new_freq, g_inj_tx_vdev.vdev_id);
+			status = wma_injection_destroy_tx_vdev(wma_handle);
+			if (QDF_IS_STATUS_ERROR(status)) {
+				wma_warn("Monitor hopping helper teardown failed: %d",
+					 status);
+				goto unlock;
+			}
+		} else if (ctx->recreate_helper_on_retune) {
 			wma_info("Monitor retune to %u MHz: recreate TX helper vdev %u after directed-peer injection",
 				 new_freq, g_inj_tx_vdev.vdev_id);
 			status = wma_injection_destroy_tx_vdev(wma_handle);
@@ -1331,21 +1388,19 @@ QDF_STATUS wma_injection_notify_channel_change(tp_wma_handle wma_handle,
 			}
 		}
 
-		/*
-		 * Keep a valid RF owner on the requested channel while the real
-		 * monitor vdev is restarted. Firmware accepts this synchronized
-		 * helper restart and monitor injection can reuse it afterward.
-		 */
-		status = wma_injection_ensure_tx_vdev(wma_handle, mon_vdev_id,
-						       new_freq);
-		if (QDF_IS_STATUS_ERROR(status)) {
-			wma_warn("Monitor retune helper restart to %u MHz failed: %d",
-				 new_freq, status);
-			goto unlock;
-		}
+		if (!defer_helper_until_stable) {
+			/* Keep an RF owner on the target channel during monitor restart. */
+			status = wma_injection_ensure_tx_vdev(wma_handle, mon_vdev_id,
+							       new_freq);
+			if (QDF_IS_STATUS_ERROR(status)) {
+				wma_warn("Monitor retune helper restart to %u MHz failed: %d",
+					 new_freq, status);
+				goto unlock;
+			}
 
-		wma_info("Monitor retune to %u MHz: keep retargeted TX helper vdev %u",
-			 new_freq, g_inj_tx_vdev.vdev_id);
+			wma_info("Monitor retune to %u MHz: keep retargeted TX helper vdev %u",
+				 new_freq, g_inj_tx_vdev.vdev_id);
+		}
 	}
 unlock:
 	qdf_mutex_release(&ctx->helper_lock);
@@ -1355,6 +1410,7 @@ unlock:
 	return status;
 transition_done:
 	ctx->helper_transitioning = false;
+	ctx->channel_settling = false;
 	return status;
 }
 
@@ -1364,17 +1420,18 @@ void wma_injection_complete_channel_change(tp_wma_handle wma_handle,
 {
 	struct wma_injection_queue_ctx *ctx = &g_wma_injection_ctx;
 	bool queue_has_frames;
+	bool arm_settle = false;
 
 	if (!wma_handle || !ctx->is_initialized)
 		return;
 	if (QDF_IS_STATUS_ERROR(qdf_mutex_acquire(&ctx->helper_lock)))
 		return;
-	if (!ctx->helper_transitioning) {
+	if (!ctx->helper_transitioning && !ctx->channel_settling) {
 		qdf_mutex_release(&ctx->helper_lock);
 		return;
 	}
 
-	if (!success && g_inj_tx_vdev.created &&
+	if (!success && ctx->helper_transitioning && g_inj_tx_vdev.created &&
 	    g_inj_tx_vdev.monitor_vdev_id == mon_vdev_id) {
 		QDF_STATUS status;
 
@@ -1387,16 +1444,20 @@ void wma_injection_complete_channel_change(tp_wma_handle wma_handle,
 	}
 
 	ctx->helper_transitioning = false;
+	if (success && ctx->channel_settling)
+		arm_settle = true;
+	else
+		ctx->channel_settling = false;
 	qdf_spin_lock_bh(&ctx->queue_lock);
 	queue_has_frames = !qdf_list_empty(&ctx->queue);
 	qdf_spin_unlock_bh(&ctx->queue_lock);
+	if (arm_settle && !ctx->helper_stopping && !cds_is_driver_recovering())
+		qdf_delayed_work_start(&ctx->settle_work,
+				       WMA_INJECTION_CHANNEL_SETTLE_MS);
 	qdf_mutex_release(&ctx->helper_lock);
 
 	wma_info("Monitor channel transition complete: vdev=%u success=%u queued=%u",
 		 mon_vdev_id, success, queue_has_frames);
-	if (queue_has_frames && !ctx->helper_stopping &&
-	    !cds_is_driver_recovering())
-		qdf_sched_work(0, &ctx->queue_work);
 }
 
 static QDF_STATUS
@@ -1677,7 +1738,7 @@ QDF_STATUS wma_process_injection_queue(tp_wma_handle wma_handle)
 
 	if (cds_is_driver_recovering() || !ctx->is_initialized ||
 	    ctx->helper_stopping ||
-	    ctx->helper_transitioning) {
+	    ctx->helper_transitioning || ctx->channel_settling) {
 		wma_debug("Injection queue not initialized");
 		return QDF_STATUS_E_AGAIN;
 	}
@@ -1804,7 +1865,7 @@ static void wma_process_injection_queue_work(void *arg)
 
 	if (cds_is_driver_recovering() || !ctx->is_initialized ||
 	    ctx->helper_stopping ||
-	    ctx->helper_transitioning) {
+	    ctx->helper_transitioning || ctx->channel_settling) {
 		wma_debug("Injection queue not initialized");
 		return;
 	}
@@ -1829,17 +1890,26 @@ static void wma_process_injection_queue_work(void *arg)
 
 	if (queue_has_frames && !cds_is_driver_recovering() &&
 	    !ctx->helper_stopping &&
-	    !ctx->helper_transitioning) {
+	    !ctx->helper_transitioning && !ctx->channel_settling) {
 		/* Apply backpressure if queue is congested */
 		backpressure_delay = status == QDF_STATUS_E_BUSY ? 2 :
 			wma_apply_injection_backpressure(ctx);
-		
+
 		if (backpressure_delay > 0) {
 			qdf_delayed_work_start(&ctx->delayed_work, backpressure_delay);
 		} else {
 			/* Schedule immediate work for next processing cycle */
 			qdf_sched_work(0, &ctx->queue_work);
 		}
+	} else if (!queue_has_frames && g_inj_tx_vdev.created &&
+		   !ctx->helper_stopping && !ctx->helper_transitioning &&
+		   !ctx->channel_settling &&
+		   !cds_is_driver_recovering()) {
+		/* Queue drained: arm idle reclaim so a stale helper does not
+		 * keep affecting monitor RX after injection stops.
+		 */
+		qdf_delayed_work_start(&ctx->idle_work,
+				       WMA_INJECTION_IDLE_RECLAIM_DELAY_MS);
 	}
 }
 
@@ -1856,10 +1926,39 @@ static void wma_process_injection_queue_delayed_work(void *context)
 
 	if (cds_is_driver_recovering() || !ctx->is_initialized ||
 	    ctx->helper_stopping ||
-	    ctx->helper_transitioning)
+	    ctx->helper_transitioning || ctx->channel_settling)
 		return;
 
 	qdf_sched_work(0, &ctx->queue_work);
+}
+
+static void wma_injection_channel_settle_work_cb(void *context)
+{
+	struct wma_injection_queue_ctx *ctx = &g_wma_injection_ctx;
+	bool queue_has_frames;
+
+	if (!ctx->is_initialized || ctx->helper_stopping ||
+	    cds_is_driver_recovering())
+		return;
+
+	if (QDF_IS_STATUS_ERROR(qdf_mutex_acquire(&ctx->helper_lock)))
+		return;
+	if (!ctx->is_initialized || ctx->helper_stopping ||
+	    ctx->helper_transitioning || !ctx->channel_settling ||
+	    cds_is_driver_recovering()) {
+		qdf_mutex_release(&ctx->helper_lock);
+		return;
+	}
+	ctx->channel_settling = false;
+	qdf_spin_lock_bh(&ctx->queue_lock);
+	queue_has_frames = !qdf_list_empty(&ctx->queue);
+	qdf_spin_unlock_bh(&ctx->queue_lock);
+	qdf_mutex_release(&ctx->helper_lock);
+
+	wma_info("Monitor channel stable: resume injection queue queued=%u",
+		 queue_has_frames);
+	if (queue_has_frames)
+		qdf_sched_work(0, &ctx->queue_work);
 }
 
 /**
@@ -1945,6 +2044,57 @@ next_entry:
 				       WMA_INJECTION_REAPER_INTERVAL_MS);
 }
 
+/*
+ * wma_injection_idle_reclaim_work_cb() - Reclaim idle injection helper
+ *
+ * Destroy the hidden STA helper when the injection queue has been idle
+ * (empty and no in-flight nbufs) for WMA_INJECTION_IDLE_RECLAIM_DELAY_MS.
+ * This releases the helper's RF ownership so monitor RX is unaffected
+ * after injection stops, instead of waiting for a later teardown.
+ */
+static void wma_injection_idle_reclaim_work_cb(void *arg)
+{
+	struct wma_injection_queue_ctx *ctx = &g_wma_injection_ctx;
+	tp_wma_handle wma_handle;
+	QDF_STATUS status;
+
+	if (!ctx->is_initialized || ctx->helper_stopping ||
+	    ctx->helper_transitioning || ctx->channel_settling ||
+	    cds_is_driver_recovering())
+		return;
+
+	wma_handle = cds_get_context(QDF_MODULE_ID_WMA);
+	if (!wma_handle || !wma_handle->wmi_handle ||
+	    wmi_is_blocked(wma_handle->wmi_handle))
+		return;
+
+	if (QDF_IS_STATUS_ERROR(qdf_mutex_acquire(&ctx->helper_lock)))
+		return;
+	/* Recheck activity after serializing against submission and teardown. */
+	qdf_spin_lock_bh(&ctx->queue_lock);
+	if (!qdf_list_empty(&ctx->queue) ||
+	    qdf_atomic_read(&ctx->inflight_count) ||
+	    !g_inj_tx_vdev.created || !ctx->is_initialized ||
+	    ctx->helper_stopping || ctx->helper_transitioning ||
+	    ctx->channel_settling ||
+	    cds_is_driver_recovering()) {
+		qdf_spin_unlock_bh(&ctx->queue_lock);
+		qdf_mutex_release(&ctx->helper_lock);
+		return;
+	}
+	qdf_spin_unlock_bh(&ctx->queue_lock);
+
+	if (g_inj_tx_vdev.created) {
+		wma_info("Injection idle: reclaiming TX helper vdev %u",
+			 g_inj_tx_vdev.vdev_id);
+		status = wma_injection_destroy_tx_vdev(wma_handle);
+		if (QDF_IS_STATUS_ERROR(status))
+			wma_warn("Injection idle: helper reclaim failed: %d",
+				 status);
+	}
+	qdf_mutex_release(&ctx->helper_lock);
+}
+
 QDF_STATUS wma_init_injection_queue(tp_wma_handle wma_handle)
 {
 	struct wma_injection_queue_ctx *ctx = &g_wma_injection_ctx;
@@ -2004,6 +2154,35 @@ QDF_STATUS wma_init_injection_queue(tp_wma_handle wma_handle)
 		return status;
 	}
 
+	/* Initialize idle-reclaim timer */
+	status = qdf_delayed_work_create(&ctx->idle_work,
+					 wma_injection_idle_reclaim_work_cb, NULL);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		wma_err("Failed to create idle reclaim work: %d", status);
+		qdf_delayed_work_destroy(&ctx->reaper_work);
+		qdf_delayed_work_destroy(&ctx->delayed_work);
+		qdf_mutex_destroy(&ctx->helper_lock);
+		qdf_spinlock_destroy(&ctx->cache_lock);
+		qdf_spinlock_destroy(&ctx->queue_lock);
+		qdf_list_destroy(&ctx->queue);
+		return status;
+	}
+
+	/* Initialize monitor channel-stability timer */
+	status = qdf_delayed_work_create(&ctx->settle_work,
+					 wma_injection_channel_settle_work_cb, NULL);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		wma_err("Failed to create channel settle work: %d", status);
+		qdf_delayed_work_destroy(&ctx->idle_work);
+		qdf_delayed_work_destroy(&ctx->reaper_work);
+		qdf_delayed_work_destroy(&ctx->delayed_work);
+		qdf_mutex_destroy(&ctx->helper_lock);
+		qdf_spinlock_destroy(&ctx->cache_lock);
+		qdf_spinlock_destroy(&ctx->queue_lock);
+		qdf_list_destroy(&ctx->queue);
+		return status;
+	}
+
 	/* Initialize context */
 	ctx->queue_size = 0;
 	ctx->max_queue_size = WMA_FRAME_INJECT_MAX_QUEUE_SIZE;
@@ -2019,6 +2198,7 @@ QDF_STATUS wma_init_injection_queue(tp_wma_handle wma_handle)
 	qdf_atomic_set(&g_inj_peer_rsp.result, QDF_STATUS_SUCCESS);
 	ctx->helper_stopping = false;
 	ctx->helper_transitioning = false;
+	ctx->channel_settling = false;
 	ctx->recreate_helper_on_retune = false;
 	ctx->is_initialized = true;
 
@@ -2066,6 +2246,14 @@ QDF_STATUS wma_deinit_injection_queue(tp_wma_handle wma_handle)
 	/* Stop and destroy reaper timer */
 	qdf_delayed_work_stop_sync(&ctx->reaper_work);
 	qdf_delayed_work_destroy(&ctx->reaper_work);
+
+	/* Stop and destroy idle reclaim timer */
+	qdf_delayed_work_stop_sync(&ctx->idle_work);
+	qdf_delayed_work_destroy(&ctx->idle_work);
+
+	/* Stop and destroy channel-stability timer */
+	qdf_delayed_work_stop_sync(&ctx->settle_work);
+	qdf_delayed_work_destroy(&ctx->settle_work);
 
 	/* No worker can submit another frame while the helper is destroyed. */
 	wma_injection_destroy_tx_vdev(wma_handle);
@@ -2148,6 +2336,7 @@ void wma_injection_ssr_resume(tp_wma_handle wma_handle)
 	qdf_atomic_set(&g_inj_peer_rsp.completed,
 		       WMA_INJECTION_PEER_RSP_NONE);
 	ctx->helper_transitioning = false;
+	ctx->channel_settling = false;
 	ctx->helper_stopping = false;
 	ctx->recreate_helper_on_retune = false;
 
@@ -2276,6 +2465,9 @@ QDF_STATUS wma_queue_injection_frame(tp_wma_handle wma_handle,
 		wma_err("Failed to allocate injection queue node");
 		return QDF_STATUS_E_NOMEM;
 	}
+
+	/* Stop idle reclaim before making new work visible to the queue. */
+	qdf_delayed_work_stop_sync(&ctx->idle_work);
 
 	/* Add to queue */
 	qdf_spin_lock_bh(&ctx->queue_lock);
@@ -2479,6 +2671,7 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	    !g_wma_injection_ctx.is_initialized ||
 	    g_wma_injection_ctx.helper_stopping ||
 	    g_wma_injection_ctx.helper_transitioning ||
+	    g_wma_injection_ctx.channel_settling ||
 	    !wma_handle->wmi_handle || wmi_is_blocked(wma_handle->wmi_handle))
 		return QDF_STATUS_E_AGAIN;
 
@@ -2707,7 +2900,8 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 		}
 		helper_locked = true;
 		if (g_wma_injection_ctx.helper_stopping ||
-		    g_wma_injection_ctx.helper_transitioning) {
+		    g_wma_injection_ctx.helper_transitioning ||
+		    g_wma_injection_ctx.channel_settling) {
 			qdf_mutex_release(&g_wma_injection_ctx.helper_lock);
 			qdf_nbuf_free(wmi_buf);
 			return QDF_STATUS_E_AGAIN;

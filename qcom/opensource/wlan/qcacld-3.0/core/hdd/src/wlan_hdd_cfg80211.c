@@ -25873,7 +25873,14 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 			injection_wma, adapter->vdev_id,
 			chandef->chan->center_freq);
 		if (QDF_IS_STATUS_ERROR(status)) {
-			hdd_err_rl("Injection helper blocked monitor retune to %u: %d",
+			/*
+			 * Do not restart the monitor while the hidden helper
+			 * still owns firmware/RF state on the old channel.
+			 * WMA has already released its transition gate on
+			 * failure; propagate the error instead of creating a
+			 * cfg80211/WMI channel-state mismatch.
+			 */
+			hdd_err_rl("Injection helper preparation blocked monitor retune to %u: %d",
 				   chandef->chan->center_freq, status);
 			return qdf_status_to_os_return(status);
 		}
